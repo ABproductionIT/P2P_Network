@@ -1,64 +1,145 @@
-# WebRTC P2P TCP Proxy Prototype
+# WebRTC P2P TCP Proxy
 
-Components:
+Browser client on **GitHub Pages** (static). Python signaling / agent / local proxy on **any VPS** you control. The HTML is not served by the Python process.
 
-- `signaling_server.py` — WebSocket signaling.
-- `agent.py` — remote WebRTC agent that fetches HTTP(S) pages and opens TCP connections from its network.
-- `client.html` — "browser in a browser": address bar, back/forward/reload and an iframe whose traffic goes through the agent.
-- `sw.js` — service worker that routes every request of the embedded page over WebRTC.
-- `local_proxy.py` — local HTTP/HTTPS proxy for a real browser; every connection is tunneled through the agent.
-- `requirements.txt` — Python dependencies.
+| Piece | Where it runs | Role |
+|---|---|---|
+| `docs/` (`index.html`, `sw.js`) | GitHub Pages (or any static host) | Browser-in-a-browser UI |
+| `signaling_server.py` | Public VPS | WebSocket signaling only |
+| `agent.py` | Machine whose network you expose | WebRTC peer that fetches / opens TCP |
+| `local_proxy.py` | Your laptop (optional) | Real Chrome via local HTTP proxy |
+| `requirements.txt` | VPS / agent host | Python deps |
 
 Two ways to browse through the agent:
 
-| | `local_proxy.py` + real Chrome | `client.html` (browser in a browser) |
+| | `local_proxy.py` + real Chrome | GitHub Pages client |
 |---|---|---|
-| Address bar / `location` | real domain | `127.0.0.1/__p/...` (shown as real in the toolbar) |
-| TLS | end-to-end, the browser's own | terminated on the agent (Chrome fingerprint via `curl_cffi`) |
-| Captchas, anti-bot checks (Google search, reCAPTCHA, Turnstile) | work like in a normal browser | in-page checks see the proxy and may block |
-| Install on the client | Python + this script | nothing, just open a page |
+| Address bar / `location` | real domain | Pages origin + `/__p/...` (shown as real in the toolbar) |
+| TLS | end-to-end, the browser's own | terminated on the agent (`curl_cffi`) |
+| Captchas / anti-bot | work like a normal browser | in-page checks may block |
+| Client install | Python + script | open the Pages URL |
 
-Use `local_proxy.py` when sites must not notice the proxy (captchas, logins, anti-bot checks).
-
-## 1. Install
+## 1. Install Python deps (VPS and/or agent host)
 
 ```bash
+git clone https://github.com/ABproductionIT/P2P_Network.git
+cd P2P_Network
+git checkout develop
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## 2. Start signaling
+## 2. Run the signaling server on a VPS
+
+Entrypoint: `signaling_server.py`. Bind with flags or env:
 
 ```bash
+# defaults: HOST=0.0.0.0 PORT=9000
 python signaling_server.py
+
+# explicit
+python signaling_server.py --host 0.0.0.0 --port 9000
+
+# env form
+HOST=0.0.0.0 PORT=9000 python signaling_server.py
 ```
 
-Default port: `9000` (`PORT=...` to change).
+Open the firewall for that port. From a browser on **HTTPS** GitHub Pages you must terminate TLS in front of the process (nginx/Caddy) and expose **`wss://your-vps:443`** (or another TLS port). Plain `ws://` only works when the client page itself is HTTP (e.g. local static server).
 
-## 3. Start agent
+Example nginx stream/location sketch (TLS at 443, proxy to local 9000):
 
-On the computer whose network you want to access:
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:9000;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host;
+}
+```
+
+Then the client server URL is `wss://your.domain`.
+
+## 3. Start the agent
+
+On the computer whose network you want to reach (same username the browser will type):
 
 ```bash
-SIGNALING=ws://SIGNALING_SERVER_IP:9000 ROOM=agent-001 python agent.py
+python agent.py --signaling wss://your.domain --username alice
+
+# env form (ROOM and USERNAME are aliases)
+SIGNALING=wss://your.domain ROOM=alice python agent.py
 ```
 
-For a same-machine test:
+Same-machine smoke test:
 
 ```bash
-SIGNALING=ws://127.0.0.1:9000 ROOM=agent-001 python agent.py
+python signaling_server.py --port 9000
+python agent.py --signaling ws://127.0.0.1:9000 --username agent-001
 ```
 
-## 4a. Real browser through `local_proxy.py` (recommended)
+Useful flags / env:
 
-On your computer:
+| Flag | Env | Meaning |
+|---|---|---|
+| `--signaling` | `SIGNALING` | Signaling WebSocket URL |
+| `--username` / `--room` | `ROOM` or `USERNAME` | Shared identity with the browser |
+| `--insecure-tls` | `INSECURE_TLS=1` | Accept self-signed upstream certs |
+| `--impersonate` | `IMPERSONATE` | `curl_cffi` profile (default `chrome`) |
+
+## 4. Enable GitHub Pages (static client)
+
+The client lives under **`docs/`** so Pages can publish it without coupling to Python.
+
+### One-time clicks in the GitHub UI
+
+1. Open [ABproductionIT/P2P_Network](https://github.com/ABproductionIT/P2P_Network) → **Settings** → **Pages**.
+2. Under **Build and deployment** → **Source**, choose **Deploy from a branch**.
+3. **Branch**: `develop` · **Folder**: `/docs` → **Save**.
+4. Wait a minute for the green “Your site is live at …” banner.
+
+Expected URL:
+
+**https://abproductionit.github.io/P2P_Network/**
+
+(`index.html` + `sw.js` from `docs/`; `.nojekyll` is included so Jekyll does not strip anything.)
+
+If your org blocks Pages or the Pages API, an admin must allow GitHub Pages for the org/repo, then repeat the steps above.
+
+### Local static preview (optional)
 
 ```bash
-SIGNALING=ws://SIGNALING_SERVER_IP:9000 ROOM=agent-001 python local_proxy.py
+python3 -m http.server 4173 --directory docs
+# open http://127.0.0.1:4173/
 ```
 
-Wait for `[READY]`, then start Chrome with a separate profile that uses the proxy:
+## 5. Connect from the client
+
+1. Open the Pages URL (or local static preview).
+2. In **Connect**:
+   - **Server URL** — public signaling endpoint, e.g. `wss://your.domain` or `ws://VPS_IP:9000`.
+   - **Username** — same string as the agent’s `--username` / `ROOM`.
+3. Click **Connect**.
+4. Type an address reachable from the agent (e.g. `192.168.1.1`, `https://example.com`) and press Enter.
+
+Values are remembered in `localStorage`. On HTTPS Pages, `http://` / `ws://` inputs are upgraded to `wss://`.
+
+How the Pages client works:
+
+- The page is shown in an iframe under `/__p/<scheme>/<host:port>/<path>`.
+- `sw.js` intercepts every request of that iframe and hands it to the page.
+- The page opens an `http` DataChannel per request; the agent performs it from its network.
+- **Raw TCP test** (gear panel) still opens a `tcp:<host>:<port>` tunnel.
+
+## 6. Optional: real browser via `local_proxy.py`
+
+```bash
+python local_proxy.py --signaling wss://your.domain --username alice
+# LISTEN_HOST / LISTEN_PORT or --listen-host / --listen-port
+```
+
+Wait for `[READY]`, then:
 
 ```bash
 google-chrome --user-data-dir="$HOME/.p2p-chrome" \
@@ -66,54 +147,12 @@ google-chrome --user-data-dir="$HOME/.p2p-chrome" \
   --force-webrtc-ip-handling-policy=disable_non_proxied_udp
 ```
 
-Every connection (including DNS resolution) is made from the agent's network; sites see a normal
-Chrome with real hostnames, coming from the agent's IP. `LISTEN_PORT` changes the proxy port.
-
-## 4b. Browser in a browser (`client.html`)
-
-The signaling server also serves the client: open `http://127.0.0.1:9000/` (service workers need
-`localhost`/`127.0.0.1` or HTTPS; on another machine put it behind HTTPS). The signaling URL is
-pre-filled from the address you opened.
-
-Set the room, click **Connect**, then type an address reachable from the agent
-(e.g. `192.168.1.1`, `intranet.local:8080/admin`, `https://example.com`) and press Enter.
-
-How it works:
-
-- The page is shown in an iframe at `/__p/<scheme>/<host:port>/<path>`.
-- `sw.js` intercepts every request of that iframe (HTML, CSS, JS, images, forms, XHR/fetch) and hands it to `client.html`.
-- `client.html` opens an `http` DataChannel per request; the agent performs the request from its network
-  (HTTP and HTTPS, cookies kept per session, redirects passed back to the browser) and streams the response.
-- The **Raw TCP test** panel (gear button) still opens a plain `tcp:<host>:<port>` tunnel.
-
-The agent fetches with `curl_cffi` impersonating Chrome (TLS + HTTP/2 fingerprint and default headers),
-and the service worker sends `Referer`, `Origin` and `Sec-Fetch-*` as if the page were opened on its
-real domain. `IMPERSONATE=chrome146` (or another `curl_cffi` profile) selects the browser profile.
-Cookies the page sets through `document.cookie` are forwarded to the agent's cookie jar, and the
-site's script-visible cookies are readable by the page, so JS-set session cookies work.
-
-Google search is an exception: its BotGuard challenge runs inside the page, sees the proxy origin and
-the service worker, and Google answers with `/sorry` (captcha). Use `local_proxy.py` for Google.
-
-Set `INSECURE_TLS=1` on the agent to accept self-signed certificates (routers, NAS, etc.).
-
-Limitations: WebSockets opened by the proxied page and cross-origin iframes inside it bypass the tunnel;
-proxied pages run on the client's origin, so only open sites you trust.
-
 ## Important
 
 This is a development prototype, not a production VPN.
 
-The current agent accepts arbitrary TCP destinations supplied by a connected peer. Do not expose it to untrusted users or the public Internet without authentication and an ACL.
+The agent accepts arbitrary TCP destinations from a connected peer. Do not expose it to untrusted users or the public Internet without authentication and an ACL.
 
-For production use add:
+For production use add authentication, destination ACLs, WSS, TURN fallback, session limits, auditing, and multiplexing instead of one DataChannel per stream.
 
-- authentication / per-agent credentials
-- destination subnet and port ACLs
-- TLS/WSS for signaling
-- TURN fallback
-- connection/session limits
-- logging and auditing
-- multiplexing instead of one DataChannel per TCP stream
-
-The WebSocket server handles signaling only. Application traffic is intended to flow over WebRTC.
+Application traffic is intended to flow over WebRTC; the WebSocket server is signaling only.

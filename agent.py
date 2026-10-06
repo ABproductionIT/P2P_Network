@@ -1,3 +1,8 @@
+#!/usr/bin/env python3
+"""Remote WebRTC agent: fetches HTTP(S) and opens TCP from its network."""
+from __future__ import annotations
+
+import argparse
 import asyncio
 import json
 import os
@@ -19,11 +24,41 @@ from aiortc import (
 from aiortc.sdp import candidate_from_sdp
 
 SIGNALING = os.getenv("SIGNALING", "ws://127.0.0.1:9000")
-ROOM = os.getenv("ROOM", "agent-001")
+# ROOM and USERNAME are aliases: the browser "Username" field joins this room.
+ROOM = os.getenv("ROOM") or os.getenv("USERNAME") or "agent-001"
 INSECURE_TLS = os.getenv("INSECURE_TLS") == "1"
 # TLS/HTTP2 fingerprint profile for Chromium-based clients (Chrome, Edge,
 # Opera...); Firefox and Safari clients get their own family automatically.
 IMPERSONATE = os.getenv("IMPERSONATE", "chrome")
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="WebRTC P2P agent (runs on the machine whose network you expose).",
+    )
+    parser.add_argument(
+        "--signaling",
+        default=SIGNALING,
+        help="Signaling WebSocket URL (env SIGNALING).",
+    )
+    parser.add_argument(
+        "--username", "--room",
+        dest="username",
+        default=ROOM,
+        help="Shared identity / room with the browser client (env ROOM or USERNAME).",
+    )
+    parser.add_argument(
+        "--insecure-tls",
+        action="store_true",
+        default=INSECURE_TLS,
+        help="Accept self-signed TLS on agent fetches (env INSECURE_TLS=1).",
+    )
+    parser.add_argument(
+        "--impersonate",
+        default=IMPERSONATE,
+        help="curl_cffi browser profile (env IMPERSONATE, default chrome).",
+    )
+    return parser.parse_args(argv)
 
 # aiortc advertises a 64 KiB max message size; stay well below it.
 CHUNK = 16 * 1024
@@ -385,17 +420,18 @@ async def handle_offer(ws, message):
     print(f"[{peer_id}] [WEBRTC] answer sent")
 
 
-async def main():
+async def run_agent(signaling: str, username: str):
     while True:
         try:
-            print("[SIGNALING] connecting...")
-            async with websockets.connect(SIGNALING) as ws:
+            print("[SIGNALING] connecting to", signaling, "as", username)
+            async with websockets.connect(signaling) as ws:
                 print("[SIGNALING] connected")
 
                 await ws.send(json.dumps({
                     "type": "join",
-                    "room": ROOM,
-                    "role": "agent"
+                    "room": username,
+                    "role": "agent",
+                    "username": username,
                 }))
 
                 async for raw in ws:
@@ -414,5 +450,14 @@ async def main():
             print("Reconnect in 3 seconds")
             await asyncio.sleep(3)
 
+
+def main(argv=None):
+    global INSECURE_TLS, IMPERSONATE
+    args = parse_args(argv)
+    INSECURE_TLS = bool(args.insecure_tls)
+    IMPERSONATE = args.impersonate
+    asyncio.run(run_agent(args.signaling, args.username))
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

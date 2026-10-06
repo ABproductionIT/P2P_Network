@@ -1,64 +1,60 @@
+#!/usr/bin/env python3
+"""WebSocket signaling server for the WebRTC P2P proxy.
+
+Signaling only — it does not serve the browser client. Host the static client
+on GitHub Pages (see docs/) or any static file server, and point the page at
+this server's public ws:// or wss:// URL.
+"""
+from __future__ import annotations
+
+import argparse
 import asyncio
 import json
 import os
-import re
-from http import HTTPStatus
-from pathlib import Path
+import sys
 
 import websockets
-from websockets.datastructures import Headers
-from websockets.http11 import Response
-
-PORT = int(os.getenv("PORT", "9000"))
-
-# The client is served from the site root so its service worker controls the
-# whole origin; root-relative navigations ("/search") then stay in the proxy.
-ROOT = Path(__file__).resolve().parent
-STATIC = {
-    "/": ("client.html", "text/html; charset=utf-8"),
-    "/client.html": ("client.html", "text/html; charset=utf-8"),
-    "/sw.js": ("sw.js", "text/javascript; charset=utf-8"),
-}
-
-rooms = {}
 
 
-def serve_static(connection, request):
-    if request.headers.get("Upgrade", "").lower() == "websocket":
-        return None
-    entry = STATIC.get(request.path.split("?", 1)[0])
-    if entry is None:
-        return connection.respond(HTTPStatus.NOT_FOUND, "Not found\n")
-    name, content_type = entry
-    body = (ROOT / name).read_bytes()
-    if name == "client.html":
-        host = request.headers.get("Host", "")
-        if not re.fullmatch(r"[A-Za-z0-9.\-\[\]:]+", host):
-            host = f"127.0.0.1:{PORT}"
-        body = body.replace(
-            b'<meta name="signaling" content="">',
-            f'<meta name="signaling" content="ws://{host}">'.encode(),
-        )
-    headers = Headers([
-        ("Content-Type", content_type),
-        ("Content-Length", str(len(body))),
-        ("Cache-Control", "no-cache"),
-    ])
-    return Response(200, "OK", headers, body)
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="WebRTC P2P signaling server (WebSocket only).",
+    )
+    parser.add_argument(
+        "--host",
+        default=os.getenv("HOST", "0.0.0.0"),
+        help="Bind address (env HOST, default 0.0.0.0).",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.getenv("PORT", "9000")),
+        help="Bind port (env PORT, default 9000).",
+    )
+    return parser.parse_args(argv)
+
+
+rooms: dict[str, set] = {}
 
 
 async def handler(ws):
     room_id = None
+    username = None
     try:
         async for raw in ws:
             message = json.loads(raw)
 
             if message.get("type") == "join":
                 room_id = message["room"]
+                username = message.get("username") or message.get("role") or "?"
                 room = rooms.setdefault(room_id, set())
                 room.add(ws)
-                print(f"[+] peer joined room={room_id}")
-                await ws.send(json.dumps({"type": "joined", "room": room_id}))
+                print(f"[+] peer joined room={room_id} user={username}")
+                await ws.send(json.dumps({
+                    "type": "joined",
+                    "room": room_id,
+                    "username": message.get("username"),
+                }))
                 continue
 
             if not room_id:
@@ -77,13 +73,20 @@ async def handler(ws):
             rooms[room_id].discard(ws)
             if not rooms[room_id]:
                 del rooms[room_id]
-        print(f"[-] peer disconnected room={room_id}")
+        print(f"[-] peer disconnected room={room_id} user={username}")
 
-async def main():
-    print(f"Signaling server: ws://0.0.0.0:{PORT}")
-    print(f"Browser client:   http://127.0.0.1:{PORT}/")
-    async with websockets.serve(handler, "0.0.0.0", PORT, process_request=serve_static):
+
+async def main(argv=None):
+    args = parse_args(argv)
+    print(f"Signaling server: ws://{args.host}:{args.port}")
+    print("Static browser client is not served from here.")
+    print("Open the GitHub Pages client (docs/) and enter this server URL + username.")
+    async with websockets.serve(handler, args.host, args.port):
         await asyncio.Future()
 
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        sys.exit(0)

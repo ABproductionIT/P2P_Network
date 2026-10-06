@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Local HTTP proxy that tunnels every browser connection through the agent.
 
 Point a browser at it and it talks to real sites end-to-end: real hostnames
@@ -5,6 +6,9 @@ in the address bar, the browser's own TLS and fingerprint, cookies on the
 real domains. The agent only relays TCP bytes from its network, so sites see
 a normal browser coming from the agent's IP.
 """
+from __future__ import annotations
+
+import argparse
 import asyncio
 import json
 import os
@@ -17,10 +21,39 @@ from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration
 from agent import CHUNK, ICE_SERVERS, attach_inbox, send_bytes, wait_buffered
 
 SIGNALING = os.getenv("SIGNALING", "ws://127.0.0.1:9000")
-ROOM = os.getenv("ROOM", "agent-001")
+ROOM = os.getenv("ROOM") or os.getenv("USERNAME") or "agent-001"
 LISTEN_HOST = os.getenv("LISTEN_HOST", "127.0.0.1")
 LISTEN_PORT = int(os.getenv("LISTEN_PORT", "9002"))
 PEER_ID = "proxy-" + uuid.uuid4().hex[:8]
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Local HTTP/HTTPS proxy tunneled through the WebRTC agent.",
+    )
+    parser.add_argument(
+        "--signaling",
+        default=SIGNALING,
+        help="Signaling WebSocket URL (env SIGNALING).",
+    )
+    parser.add_argument(
+        "--username", "--room",
+        dest="username",
+        default=ROOM,
+        help="Shared identity / room with the agent (env ROOM or USERNAME).",
+    )
+    parser.add_argument(
+        "--listen-host",
+        default=LISTEN_HOST,
+        help="Proxy bind host (env LISTEN_HOST, default 127.0.0.1).",
+    )
+    parser.add_argument(
+        "--listen-port",
+        type=int,
+        default=LISTEN_PORT,
+        help="Proxy bind port (env LISTEN_PORT, default 9002).",
+    )
+    return parser.parse_args(argv)
 
 STRIP_HEADERS = {"proxy-connection", "connection", "keep-alive", "proxy-authorization"}
 
@@ -61,7 +94,12 @@ async def peer_session():
     try:
         print("[SIGNALING] connecting to", SIGNALING)
         async with websockets.connect(SIGNALING) as ws:
-            await ws.send(json.dumps({"type": "join", "room": ROOM, "role": "browser"}))
+            await ws.send(json.dumps({
+                "type": "join",
+                "room": ROOM,
+                "role": "browser",
+                "username": ROOM,
+            }))
 
             peer.createDataChannel("control")
             # aiortc gathers ICE as part of setLocalDescription.
@@ -76,12 +114,12 @@ async def peer_session():
             try:
                 sdp = await asyncio.wait_for(wait_answer(ws), 15)
             except asyncio.TimeoutError:
-                raise ConnectionError(f'no agent answered in room "{ROOM}"') from None
+                raise ConnectionError(f'no agent answered for username "{ROOM}"') from None
 
         await peer.setRemoteDescription(RTCSessionDescription(sdp=sdp, type="answer"))
         await wait_connected(peer, 20)
         pc = peer
-        print(f"[READY] proxy http://{LISTEN_HOST}:{LISTEN_PORT} -> agent in room {ROOM}")
+        print(f"[READY] proxy http://{LISTEN_HOST}:{LISTEN_PORT} -> agent username {ROOM}")
         await dead.wait()
     finally:
         if pc is peer:
@@ -210,12 +248,22 @@ async def handle_client(reader, writer):
     await relay(reader, writer, channel, inbox, initial)
 
 
-async def main():
+async def run_proxy():
     server = await asyncio.start_server(handle_client, LISTEN_HOST, LISTEN_PORT)
     print(f"[PROXY] listening on http://{LISTEN_HOST}:{LISTEN_PORT}")
     async with server:
         await asyncio.gather(server.serve_forever(), maintain_peer())
 
 
+def main(argv=None):
+    global SIGNALING, ROOM, LISTEN_HOST, LISTEN_PORT
+    args = parse_args(argv)
+    SIGNALING = args.signaling
+    ROOM = args.username
+    LISTEN_HOST = args.listen_host
+    LISTEN_PORT = args.listen_port
+    asyncio.run(run_proxy())
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

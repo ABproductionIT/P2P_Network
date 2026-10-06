@@ -3,7 +3,6 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="signaling" content="">
 <title>WebRTC P2P Browser</title>
 <style>
 * { box-sizing: border-box; }
@@ -32,7 +31,10 @@ button:disabled { opacity: .4; cursor: default; }
 #panel fieldset { border: 1px solid #ccc; border-radius: 6px; margin: 0; padding: 6px 8px; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
 #panel input { padding: 5px 8px; border: 1px solid #ccc; border-radius: 4px; }
 #panel button { background: #e8eaed; }
+#panel button.primary { background: #1a73e8; color: #fff; }
+#panel button.primary:hover:not(:disabled) { background: #1558b0; }
 #log { width: 100%; margin: 0; max-height: 180px; overflow: auto; white-space: pre-wrap; background: #111; color: #ddd; padding: 8px; font: 12px ui-monospace, monospace; }
+.hint { width: 100%; color: #666; font-size: 12px; margin: 0; }
 </style>
 </head>
 <body>
@@ -50,10 +52,10 @@ button:disabled { opacity: .4; cursor: default; }
 
 <div id="panel" class="open">
   <fieldset>
-    <legend>Agent</legend>
-    <input id="signaling" size="24" placeholder="Signaling URL">
-    <input id="room" value="agent-001" size="10" placeholder="Room">
-    <button id="connect">Connect</button>
+    <legend>Connect</legend>
+    <input id="signaling" size="36" placeholder="Server URL (wss://host:9000)" autocomplete="url">
+    <input id="username" size="14" placeholder="Username" autocomplete="username">
+    <button id="connect" class="primary">Connect</button>
   </fieldset>
   <fieldset>
     <legend>Raw TCP test</legend>
@@ -61,17 +63,19 @@ button:disabled { opacity: .4; cursor: default; }
     <input id="port" value="80" size="5" placeholder="Port">
     <button id="tcpTest">Open TCP + HTTP GET</button>
   </fieldset>
+  <p class="hint">Enter your public signaling server and the same username the agent uses as <code>ROOM</code> / <code>--username</code>. On GitHub Pages (HTTPS) use <code>wss://</code>.</p>
   <pre id="log"></pre>
 </div>
 
 <div id="viewport">
-  <div id="placeholder">Connect to the agent, then type an address above.<br>Every request of the page is fetched by the agent over WebRTC.</div>
+  <div id="placeholder">Enter the server URL and username, connect, then type an address above.<br>Every request of the page is fetched by the agent over WebRTC.</div>
   <iframe id="frame" name="viewer" hidden></iframe>
   <div id="loading"></div>
 </div>
 
 <script>
 const CHUNK = 16 * 1024;
+const STORAGE_KEY = "p2p-browser-connect";
 const $ = id => document.getElementById(id);
 const frame = $("frame");
 
@@ -79,11 +83,44 @@ let ws;
 let pc;
 let prefix;
 let currentTarget = null; // remote URL shown in the frame
-const peerId = "page-" + Math.random().toString(36).slice(2, 10);
+let peerId = "page-" + Math.random().toString(36).slice(2, 10);
 
-// signaling_server.py fills the meta tag when it serves this page.
-$("signaling").value = document.querySelector('meta[name="signaling"]').content
-  || `${location.protocol === "https:" ? "wss" : "ws"}://${location.hostname || "localhost"}:9000`;
+function normalizeSignalingUrl(raw) {
+  let value = (raw || "").trim();
+  if (!value) return "";
+  if (/^https:\/\//i.test(value)) value = "wss://" + value.slice(8);
+  else if (/^http:\/\//i.test(value)) value = "ws://" + value.slice(7);
+  else if (!/^(wss?|https?):\/\//i.test(value)) {
+    value = (location.protocol === "https:" ? "wss://" : "ws://") + value;
+  }
+  // Mixed content: HTTPS pages cannot open insecure ws:// sockets.
+  if (location.protocol === "https:" && value.startsWith("ws://")) {
+    value = "wss://" + value.slice(5);
+  }
+  return value.replace(/\/+$/, "");
+}
+
+function loadSavedConnect() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}");
+    if (saved.signaling) $("signaling").value = saved.signaling;
+    if (saved.username) $("username").value = saved.username;
+  } catch { /* ignore */ }
+  if (!$("signaling").value) {
+    $("signaling").placeholder = location.protocol === "https:"
+      ? "wss://your-vps.example.com:9000"
+      : "ws://127.0.0.1:9000";
+  }
+  if (!$("username").value) $("username").value = "agent-001";
+}
+
+function saveConnect(signaling, username) {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ signaling, username }));
+  } catch { /* ignore */ }
+}
+
+loadSavedConnect();
 
 function log(...args) {
   const el = $("log");
@@ -294,8 +331,24 @@ async function waitIce(peer, timeoutMs = 2000) {
 }
 
 async function connectPeer() {
-  const signaling = $("signaling").value;
-  const room = $("room").value;
+  const signaling = normalizeSignalingUrl($("signaling").value);
+  const username = $("username").value.trim();
+  $("signaling").value = signaling;
+
+  if (!signaling) {
+    log("ERROR: enter the public signaling server URL (e.g. wss://vps.example.com:9000).");
+    setStatus("Need server", "#d93025");
+    return;
+  }
+  if (!username) {
+    log("ERROR: enter a username (must match the agent's ROOM / --username).");
+    setStatus("Need username", "#d93025");
+    return;
+  }
+
+  saveConnect(signaling, username);
+  peerId = "page-" + username.replace(/[^A-Za-z0-9._-]+/g, "-").slice(0, 32)
+    + "-" + Math.random().toString(36).slice(2, 8);
 
   ws?.close();
   pc?.close();
@@ -309,12 +362,20 @@ async function connectPeer() {
     });
   } catch (e) {
     log("ERROR:", e.message);
+    if (location.protocol === "https:" && signaling.startsWith("ws://")) {
+      log("HINT: this page is HTTPS; the server must speak WSS (TLS).");
+    }
     setStatus("Disconnected", "#d93025");
     return;
   }
 
-  log("Signaling connected");
-  ws.send(JSON.stringify({ type: "join", room, role: "browser" }));
+  log("Signaling connected as", username);
+  ws.send(JSON.stringify({
+    type: "join",
+    room: username,
+    role: "browser",
+    username,
+  }));
 
   const peer = pc = new RTCPeerConnection({
     iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
@@ -375,13 +436,15 @@ async function connectPeer() {
 
   setTimeout(() => {
     if (!answered && peer === pc) {
-      log(`No answer from an agent in room "${room}". Is agent.py running with the same ROOM and SIGNALING?`);
+      log(`No answer from an agent for username "${username}". Is agent.py running with the same --username / ROOM and SIGNALING?`);
       setStatus("No agent", "#d93025");
     }
   }, 10000);
 }
 
 $("connect").onclick = connectPeer;
+$("signaling").addEventListener("keydown", e => { if (e.key === "Enter") connectPeer(); });
+$("username").addEventListener("keydown", e => { if (e.key === "Enter") connectPeer(); });
 
 // ------------------------------------------------------------ raw TCP test
 
