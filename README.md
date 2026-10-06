@@ -1,5 +1,7 @@
 # WebRTC P2P TCP Proxy
 
+**Live client:** [https://abproductionit.github.io/P2P_Network/](https://abproductionit.github.io/P2P_Network/) (GitHub Pages → `docs/index.html`)
+
 Browser client on **GitHub Pages** (static). Python signaling / agent / local proxy on **any VPS** you control. The HTML is not served by the Python process.
 
 | Piece | Where it runs | Role |
