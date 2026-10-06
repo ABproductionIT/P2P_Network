@@ -59,7 +59,11 @@ cd P2P_Network
 # or: uv venv .venv && uv pip install -r requirements.txt --python .venv/bin/python
 ```
 
-**Signaling** (defaults `0.0.0.0:9000` — no root):
+### Run in a terminal (foreground — watch the logs)
+
+Start signaling and the agent **in a normal terminal session**, in the **foreground**. Logs go to that terminal’s **stdout/stderr**. Press **Ctrl+C** in the same terminal to stop. Do **not** use `nohup`, `&`, `systemd`, `screen`/`tmux` detach, or other backgrounding if you want to see the logs there.
+
+**Signaling** (defaults `0.0.0.0:9000` — no root) — leave this terminal open:
 
 ```bash
 ./scripts/run-signaling.sh
@@ -68,7 +72,7 @@ cd P2P_Network
 
 Open the firewall for that port. From the **HTTPS** Pages client you need TLS in front of the process (nginx/Caddy) and a **`wss://your-domain`** URL — plain `ws://` only works when the page itself is HTTP.
 
-**Agent** (on the machine whose network you expose; same username the client will use):
+**Agent** (separate terminal on the machine whose network you expose; same username the client will use) — leave this terminal open too:
 
 ```bash
 .venv/bin/python agent.py --signaling wss://your-domain --username alice

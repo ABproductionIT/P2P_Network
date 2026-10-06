@@ -17,4 +17,5 @@ fi
 
 uv venv .venv
 uv pip install -r requirements.txt --python .venv/bin/python
-echo "Ready. Run signaling: ./scripts/run-signaling.sh"
+echo "Ready. In a terminal (foreground, logs visible): ./scripts/run-signaling.sh"
+echo "Ctrl+C stops it. Do not use nohup/&/systemd if you want logs in that terminal."
