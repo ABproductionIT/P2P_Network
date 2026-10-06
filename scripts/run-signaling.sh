@@ -11,4 +11,5 @@ if [[ ! -x .venv/bin/python ]]; then
 fi
 
 echo "Starting signaling in foreground on ${HOST:-0.0.0.0}:${PORT:-9000} (Ctrl+C to stop; logs below)." >&2
+echo "Clients use ws://127.0.0.1:${PORT:-9000} or ws://<LAN-IP>:${PORT:-9000} — not 0.0.0.0, not wss:// unless TLS is in front." >&2
 exec .venv/bin/python signaling_server.py --host "${HOST:-0.0.0.0}" --port "${PORT:-9000}" "$@"

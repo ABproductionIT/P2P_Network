@@ -53,7 +53,7 @@ button:disabled { opacity: .4; cursor: default; }
 <div id="panel" class="open">
   <fieldset>
     <legend>Connect</legend>
-    <input id="signaling" size="36" placeholder="Server URL (wss://host:9000)" autocomplete="url">
+    <input id="signaling" size="36" placeholder="Server URL (ws://host:9000)" autocomplete="url">
     <input id="username" size="14" placeholder="Username" autocomplete="username">
     <button id="connect" class="primary">Connect</button>
   </fieldset>
@@ -63,7 +63,7 @@ button:disabled { opacity: .4; cursor: default; }
     <input id="port" value="80" size="5" placeholder="Port">
     <button id="tcpTest">Open TCP + HTTP GET</button>
   </fieldset>
-  <p class="hint">Enter your public signaling server and the same username the agent uses as <code>ROOM</code> / <code>--username</code>. On GitHub Pages (HTTPS) use <code>wss://</code>.</p>
+  <p class="hint">Same username as the agent’s <code>--username</code> / <code>ROOM</code>. Bare signaling is <code>ws://</code> (no TLS). On GitHub Pages (HTTPS) the browser blocks mixed-content <code>ws://</code> — use TLS + <code>wss://</code>, or open this page via local <code>http://</code>. Never use <code>0.0.0.0</code> as the server URL.</p>
   <pre id="log"></pre>
 </div>
 
@@ -85,19 +85,56 @@ let prefix;
 let currentTarget = null; // remote URL shown in the frame
 let peerId = "page-" + Math.random().toString(36).slice(2, 10);
 
+function isBindOnlyHost(host) {
+  if (!host) return false;
+  const h = host.replace(/^\[|\]$/g, "").toLowerCase();
+  return h === "0.0.0.0" || h === "::";
+}
+
+/** @returns {{ ok: true, url: string } | { ok: false, error: string }} */
 function normalizeSignalingUrl(raw) {
   let value = (raw || "").trim();
-  if (!value) return "";
+  if (!value) {
+    return { ok: false, error: "enter the signaling server URL (e.g. ws://10.10.1.97:9000)." };
+  }
+
   if (/^https:\/\//i.test(value)) value = "wss://" + value.slice(8);
   else if (/^http:\/\//i.test(value)) value = "ws://" + value.slice(7);
   else if (!/^(wss?|https?):\/\//i.test(value)) {
-    value = (location.protocol === "https:" ? "wss://" : "ws://") + value;
+    // Bare host:port — prefer plain ws:// (typical VPS/LAN with no TLS).
+    value = "ws://" + value;
   }
-  // Mixed content: HTTPS pages cannot open insecure ws:// sockets.
+  value = value.replace(/\/+$/, "");
+
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch {
+    return { ok: false, error: `invalid signaling URL: ${raw}` };
+  }
+
+  const host = parsed.hostname;
+  if (isBindOnlyHost(host)) {
+    return {
+      ok: false,
+      error: "0.0.0.0 is a bind address, not a connect URL. Use ws://127.0.0.1:9000 (same machine) or ws://<LAN-IP>:9000 (e.g. ws://10.10.1.97:9000).",
+    };
+  }
+
+  // HTTPS pages (GitHub Pages) cannot open insecure ws:// (mixed content).
   if (location.protocol === "https:" && value.startsWith("ws://")) {
-    value = "wss://" + value.slice(5);
+    const example = `${host}${parsed.port ? ":" + parsed.port : ""}`;
+    return {
+      ok: false,
+      error: `This page is HTTPS, so the browser blocks plain ws://${example} (mixed content). `
+        + `Options: (1) put TLS (nginx/Caddy) in front of signaling and use wss://${example}; `
+        + `(2) open docs/index.html via a local http:// server and connect with ws://${example}; `
+        + `(3) agent CLI can use ws:// without the Pages client: `
+        + `.venv/bin/python agent.py --signaling ws://${example} --username alice`,
+    };
   }
-  return value.replace(/\/+$/, "");
+
+  return { ok: true, url: value };
 }
 
 function loadSavedConnect() {
@@ -108,8 +145,8 @@ function loadSavedConnect() {
   } catch { /* ignore */ }
   if (!$("signaling").value) {
     $("signaling").placeholder = location.protocol === "https:"
-      ? "wss://your-vps.example.com:9000"
-      : "ws://127.0.0.1:9000";
+      ? "wss://your-domain (TLS required on Pages)"
+      : "ws://127.0.0.1:9000 or ws://10.x.x.x:9000";
   }
   if (!$("username").value) $("username").value = "agent-001";
 }
@@ -331,15 +368,17 @@ async function waitIce(peer, timeoutMs = 2000) {
 }
 
 async function connectPeer() {
-  const signaling = normalizeSignalingUrl($("signaling").value);
+  const normalized = normalizeSignalingUrl($("signaling").value);
   const username = $("username").value.trim();
-  $("signaling").value = signaling;
 
-  if (!signaling) {
-    log("ERROR: enter the public signaling server URL (e.g. wss://vps.example.com:9000).");
+  if (!normalized.ok) {
+    log("ERROR:", normalized.error);
     setStatus("Need server", "#d93025");
     return;
   }
+  let signaling = normalized.url;
+  $("signaling").value = signaling;
+
   if (!username) {
     log("ERROR: enter a username (must match the agent's ROOM / --username).");
     setStatus("Need username", "#d93025");
@@ -354,19 +393,47 @@ async function connectPeer() {
   pc?.close();
   setStatus("Connecting…", "#f9ab00");
 
-  ws = new WebSocket(signaling);
-  try {
+  async function openSocket(url) {
+    const sock = new WebSocket(url);
     await new Promise((resolve, reject) => {
-      ws.onopen = resolve;
-      ws.onerror = () => reject(new Error(`cannot reach signaling server ${signaling}`));
+      sock.onopen = resolve;
+      sock.onerror = () => reject(new Error(`cannot reach signaling server ${url}`));
     });
+    return sock;
+  }
+
+  try {
+    ws = await openSocket(signaling);
   } catch (e) {
-    log("ERROR:", e.message);
-    if (location.protocol === "https:" && signaling.startsWith("ws://")) {
-      log("HINT: this page is HTTPS; the server must speak WSS (TLS).");
+    // On plain HTTP pages, wss:// against a no-TLS server can safely fall back to ws://.
+    if (location.protocol !== "https:" && signaling.startsWith("wss://")) {
+      const alt = "ws://" + signaling.slice(6);
+      log("ERROR:", e.message);
+      log("HINT: bare signaling_server.py speaks plain ws:// (no TLS). Retrying", alt);
+      try {
+        signaling = alt;
+        $("signaling").value = signaling;
+        saveConnect(signaling, username);
+        ws = await openSocket(signaling);
+      } catch (e2) {
+        log("ERROR:", e2.message);
+        log("HINT: start signaling with ./scripts/run-signaling.sh and use ws://127.0.0.1:9000 or ws://<LAN-IP>:9000.");
+        setStatus("Disconnected", "#d93025");
+        return;
+      }
+    } else {
+      log("ERROR:", e.message);
+      if (signaling.startsWith("wss://")) {
+        log("HINT: bare signaling_server.py speaks plain ws:// (no TLS). wss:// needs nginx/Caddy in front.");
+        if (location.protocol === "https:") {
+          log("HINT: GitHub Pages is HTTPS — mixed-content blocks ws://. Use TLS+wss, or open docs/ over local http://.");
+        } else {
+          log("HINT: try", "ws://" + signaling.slice(6));
+        }
+      }
+      setStatus("Disconnected", "#d93025");
+      return;
     }
-    setStatus("Disconnected", "#d93025");
-    return;
   }
 
   log("Signaling connected as", username);

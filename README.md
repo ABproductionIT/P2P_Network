@@ -6,17 +6,17 @@ Browse the internet (or a LAN) through another machine over **WebRTC**. The stat
 
 ## Architecture
 
-Browser (Pages) ↔ signaling (VPS) ↔ agent host; HTTP/TCP then rides a WebRTC data channel.
+Browser ↔ signaling ↔ agent; HTTP/TCP then rides a WebRTC data channel.
 
 ```mermaid
 flowchart LR
-  Browser["Browser<br/>GitHub Pages client"]
-  Sig["Signaling<br/>VPS · WebSocket"]
+  Browser["Browser client<br/>Pages or local docs/"]
+  Sig["Signaling<br/>plain ws:// :9000"]
   Agent["Agent host<br/>agent.py"]
   Net["Target network<br/>HTTP / TCP"]
 
-  Browser <-->|"wss signaling"| Sig
-  Agent <-->|"wss signaling"| Sig
+  Browser <-->|"ws:// LAN · or wss:// + TLS"| Sig
+  Agent <-->|"ws://HOST:9000"| Sig
   Browser <-->|"WebRTC data channel"| Agent
   Agent -->|"fetch / TCP"| Net
 ```
@@ -28,8 +28,8 @@ Enter the signaling URL and a shared username, connect, then browse through the 
 ```mermaid
 sequenceDiagram
   actor User
-  participant Client as Pages client
-  participant Sig as Signaling VPS
+  participant Client as Browser client
+  participant Sig as Signaling
   participant Agent as agent.py
 
   User->>Client: Server URL + username
@@ -43,6 +43,18 @@ sequenceDiagram
   Client->>Agent: request over data channel
   Agent-->>Client: response from agent network
 ```
+
+## Signaling URL rules (read this)
+
+| What you type | Result |
+|---------------|--------|
+| `ws://10.10.1.97:9000` | Correct for bare `signaling_server.py` (no TLS) |
+| `10.10.1.97:9000` | Normalized to `ws://…` (agent + local HTTP client) |
+| `wss://10.10.1.97:9000` | Fails unless TLS is in front — agent retries `ws://` once |
+| `0.0.0.0:9000` / `wss://0.0.0.0:9000` | **Rejected** — bind address only; use `127.0.0.1` or your LAN IP |
+
+- **Agent CLI** can always use plain `ws://` (recommended for local/VPS without certs).
+- **GitHub Pages client is HTTPS** — browsers block mixed-content `ws://`. For Pages you need TLS (nginx/Caddy) + `wss://`, **or** open `docs/index.html` via a local `http://` server and use `ws://`.
 
 ## Run on a VPS (no sudo)
 
@@ -63,21 +75,27 @@ cd P2P_Network
 
 Start signaling and the agent **in a normal terminal session**, in the **foreground**. Logs go to that terminal’s **stdout/stderr**. Press **Ctrl+C** in the same terminal to stop. Do **not** use `nohup`, `&`, `systemd`, `screen`/`tmux` detach, or other backgrounding if you want to see the logs there.
 
-**Signaling** (defaults `0.0.0.0:9000` — no root) — leave this terminal open:
+**Signaling** (binds `0.0.0.0:9000` — no root) — leave this terminal open:
 
 ```bash
 ./scripts/run-signaling.sh
 # or: .venv/bin/python signaling_server.py --host 0.0.0.0 --port 9000
 ```
 
-Open the firewall for that port. From the **HTTPS** Pages client you need TLS in front of the process (nginx/Caddy) and a **`wss://your-domain`** URL — plain `ws://` only works when the page itself is HTTP.
+Startup logs print connect URLs like `ws://127.0.0.1:9000` and `ws://<LAN-IP>:9000`. Open the firewall for that port if peers are remote.
 
 **Agent** (separate terminal on the machine whose network you expose; same username the client will use) — leave this terminal open too:
 
 ```bash
-.venv/bin/python agent.py --signaling wss://your-domain --username alice
+# LAN / no TLS (typical):
+.venv/bin/python agent.py --signaling ws://10.10.1.97:9000 --username alice
+# same machine as signaling:
+.venv/bin/python agent.py --signaling ws://127.0.0.1:9000 --username alice
 ```
 
-**Client:** open the [live page](https://abproductionit.github.io/P2P_Network/), enter `wss://your-domain` and `alice`, click **Connect**, then browse.
+**Client options:**
+
+1. **Local HTTP** (plain `ws://` works): serve `docs/` over HTTP and enter `ws://10.10.1.97:9000` + `alice`.
+2. **GitHub Pages** (HTTPS): put TLS in front of `:9000`, then enter `wss://your-domain` + `alice` on the [live page](https://abproductionit.github.io/P2P_Network/).
 
 Prototype only — do not expose the agent to untrusted users without auth and destination limits.

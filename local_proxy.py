@@ -19,6 +19,12 @@ import websockets
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration
 
 from agent import CHUNK, ICE_SERVERS, attach_inbox, send_bytes, wait_buffered
+from signaling_url import (
+    SignalingUrlError,
+    hint_for_connect_failure,
+    normalize_signaling_url,
+    plain_ws_fallback,
+)
 
 SIGNALING = os.getenv("SIGNALING", "ws://127.0.0.1:9000")
 ROOM = os.getenv("ROOM") or os.getenv("USERNAME") or "agent-001"
@@ -34,7 +40,8 @@ def parse_args(argv=None):
     parser.add_argument(
         "--signaling",
         default=SIGNALING,
-        help="Signaling WebSocket URL (env SIGNALING).",
+        help="Signaling WebSocket URL (env SIGNALING). "
+             "Bare host:port defaults to ws://. Do not use 0.0.0.0.",
     )
     parser.add_argument(
         "--username", "--room",
@@ -93,30 +100,20 @@ async def peer_session():
 
     try:
         print("[SIGNALING] connecting to", SIGNALING)
-        async with websockets.connect(SIGNALING) as ws:
-            await ws.send(json.dumps({
-                "type": "join",
-                "room": ROOM,
-                "role": "browser",
-                "username": ROOM,
-            }))
+        try:
+            ws = await websockets.connect(SIGNALING)
+        except Exception as first:
+            alt = plain_ws_fallback(SIGNALING)
+            if not alt:
+                raise
+            print("[SIGNALING]", hint_for_connect_failure(SIGNALING, first))
+            print("[SIGNALING] retrying plain WebSocket", alt)
+            ws = await websockets.connect(alt)
+        try:
+            await _offer_over_signaling(ws, peer)
+        finally:
+            await ws.close()
 
-            peer.createDataChannel("control")
-            # aiortc gathers ICE as part of setLocalDescription.
-            await peer.setLocalDescription(await peer.createOffer())
-            await ws.send(json.dumps({
-                "type": "offer",
-                "id": PEER_ID,
-                "sdp": peer.localDescription.sdp,
-            }))
-            print("[WEBRTC] offer sent, waiting for the agent...")
-
-            try:
-                sdp = await asyncio.wait_for(wait_answer(ws), 15)
-            except asyncio.TimeoutError:
-                raise ConnectionError(f'no agent answered for username "{ROOM}"') from None
-
-        await peer.setRemoteDescription(RTCSessionDescription(sdp=sdp, type="answer"))
         await wait_connected(peer, 20)
         pc = peer
         print(f"[READY] proxy http://{LISTEN_HOST}:{LISTEN_PORT} -> agent username {ROOM}")
@@ -127,14 +124,44 @@ async def peer_session():
         await peer.close()
 
 
+async def _offer_over_signaling(ws, peer):
+    await ws.send(json.dumps({
+        "type": "join",
+        "room": ROOM,
+        "role": "browser",
+        "username": ROOM,
+    }))
+
+    peer.createDataChannel("control")
+    # aiortc gathers ICE as part of setLocalDescription.
+    await peer.setLocalDescription(await peer.createOffer())
+    await ws.send(json.dumps({
+        "type": "offer",
+        "id": PEER_ID,
+        "sdp": peer.localDescription.sdp,
+    }))
+    print("[WEBRTC] offer sent, waiting for the agent...")
+
+    try:
+        sdp = await asyncio.wait_for(wait_answer(ws), 15)
+    except asyncio.TimeoutError:
+        raise ConnectionError(f'no agent answered for username "{ROOM}"') from None
+
+    await peer.setRemoteDescription(RTCSessionDescription(sdp=sdp, type="answer"))
+
+
 async def maintain_peer():
     while True:
         try:
             await peer_session()
+        except SignalingUrlError as e:
+            print("[ERROR]", e)
+            print("Fix --signaling / SIGNALING, then restart. Not retrying.")
+            return
         except Exception as e:
-            print("[ERROR]", e or type(e).__name__)
-        print("Reconnect in 3 seconds")
-        await asyncio.sleep(3)
+            print("[ERROR]", hint_for_connect_failure(SIGNALING, e) if SIGNALING else e)
+            print("Reconnect in 3 seconds")
+            await asyncio.sleep(3)
 
 
 async def open_tunnel(host, port):
@@ -258,7 +285,13 @@ async def run_proxy():
 def main(argv=None):
     global SIGNALING, ROOM, LISTEN_HOST, LISTEN_PORT
     args = parse_args(argv)
-    SIGNALING = args.signaling
+    try:
+        SIGNALING = normalize_signaling_url(args.signaling)
+    except SignalingUrlError as e:
+        print("[ERROR]", e)
+        raise SystemExit(2) from e
+    if SIGNALING != (args.signaling or "").strip().rstrip("/"):
+        print("[SIGNALING] normalized URL:", SIGNALING)
     ROOM = args.username
     LISTEN_HOST = args.listen_host
     LISTEN_PORT = args.listen_port

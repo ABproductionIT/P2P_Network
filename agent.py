@@ -23,6 +23,13 @@ from aiortc import (
 )
 from aiortc.sdp import candidate_from_sdp
 
+from signaling_url import (
+    SignalingUrlError,
+    hint_for_connect_failure,
+    normalize_signaling_url,
+    plain_ws_fallback,
+)
+
 SIGNALING = os.getenv("SIGNALING", "ws://127.0.0.1:9000")
 # ROOM and USERNAME are aliases: the browser "Username" field joins this room.
 ROOM = os.getenv("ROOM") or os.getenv("USERNAME") or "agent-001"
@@ -39,7 +46,9 @@ def parse_args(argv=None):
     parser.add_argument(
         "--signaling",
         default=SIGNALING,
-        help="Signaling WebSocket URL (env SIGNALING).",
+        help="Signaling WebSocket URL (env SIGNALING). "
+             "Default scheme for bare host:port is ws:// (no TLS). "
+             "Do not use 0.0.0.0 — that is bind-only.",
     )
     parser.add_argument(
         "--username", "--room",
@@ -420,35 +429,68 @@ async def handle_offer(ws, message):
     print(f"[{peer_id}] [WEBRTC] answer sent")
 
 
+async def agent_session(ws, username: str):
+    print("[SIGNALING] connected")
+
+    await ws.send(json.dumps({
+        "type": "join",
+        "room": username,
+        "role": "agent",
+        "username": username,
+    }))
+
+    async for raw in ws:
+        message = json.loads(raw)
+        kind = message.get("type")
+
+        if kind == "offer":
+            await handle_offer(ws, message)
+        elif kind == "candidate":
+            peer = peers.get(message.get("id") or "default")
+            if peer and peer.pc.remoteDescription:
+                await add_remote_candidate(peer.pc, message)
+
+
+async def open_signaling(url: str):
+    """Open a signaling WebSocket; if wss:// fails at connect, retry ws://."""
+    try:
+        return await websockets.connect(url)
+    except Exception as first:
+        alt = plain_ws_fallback(url)
+        if not alt:
+            raise
+        print("[SIGNALING]", hint_for_connect_failure(url, first))
+        print("[SIGNALING] retrying plain WebSocket", alt)
+        try:
+            return await websockets.connect(alt)
+        except Exception as second:
+            print("[ERROR]", hint_for_connect_failure(alt, second))
+            raise first from second
+
+
 async def run_agent(signaling: str, username: str):
     while True:
+        ws = None
         try:
             print("[SIGNALING] connecting to", signaling, "as", username)
-            async with websockets.connect(signaling) as ws:
-                print("[SIGNALING] connected")
+            ws = await open_signaling(signaling)
+            try:
+                await agent_session(ws, username)
+            finally:
+                await ws.close()
+                ws = None
 
-                await ws.send(json.dumps({
-                    "type": "join",
-                    "room": username,
-                    "role": "agent",
-                    "username": username,
-                }))
-
-                async for raw in ws:
-                    message = json.loads(raw)
-                    kind = message.get("type")
-
-                    if kind == "offer":
-                        await handle_offer(ws, message)
-                    elif kind == "candidate":
-                        peer = peers.get(message.get("id") or "default")
-                        if peer and peer.pc.remoteDescription:
-                            await add_remote_candidate(peer.pc, message)
-
-        except Exception as e:
+        except SignalingUrlError as e:
             print("[ERROR]", e)
+            print("Fix --signaling / SIGNALING, then restart. Not retrying.")
+            return
+        except Exception as e:
+            print("[ERROR]", hint_for_connect_failure(signaling, e))
             print("Reconnect in 3 seconds")
             await asyncio.sleep(3)
+        finally:
+            if ws is not None:
+                await ws.close()
 
 
 def main(argv=None):
@@ -456,7 +498,14 @@ def main(argv=None):
     args = parse_args(argv)
     INSECURE_TLS = bool(args.insecure_tls)
     IMPERSONATE = args.impersonate
-    asyncio.run(run_agent(args.signaling, args.username))
+    try:
+        signaling = normalize_signaling_url(args.signaling)
+    except SignalingUrlError as e:
+        print("[ERROR]", e)
+        raise SystemExit(2) from e
+    if signaling != (args.signaling or "").strip().rstrip("/"):
+        print("[SIGNALING] normalized URL:", signaling)
+    asyncio.run(run_agent(signaling, args.username))
 
 
 if __name__ == "__main__":
