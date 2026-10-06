@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="signaling" content="">
+<title>WebRTC P2P Browser</title>
+<style>
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body { display: flex; flex-direction: column; font: 14px system-ui, sans-serif; background: #dee1e6; }
+input, button { font: inherit; }
+button { border: 0; background: transparent; border-radius: 6px; padding: 6px 10px; cursor: pointer; }
+button:hover:not(:disabled) { background: rgba(0,0,0,.08); }
+button:disabled { opacity: .4; cursor: default; }
+
+.bar { display: flex; align-items: center; gap: 4px; padding: 6px 8px; background: #fff; border-bottom: 1px solid #ccc; }
+.nav button { font-size: 16px; width: 34px; height: 32px; padding: 0; }
+#address { flex: 1; min-width: 0; padding: 7px 14px; border: 1px solid transparent; border-radius: 18px; background: #f1f3f4; outline: none; }
+#address:focus { background: #fff; border-color: #1a73e8; }
+#status { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; color: #555; padding: 0 6px; }
+#status::before { content: ""; width: 9px; height: 9px; border-radius: 50%; background: var(--dot, #999); }
+
+#viewport { flex: 1; position: relative; background: #fff; }
+#frame { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; }
+#placeholder { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: #777; text-align: center; padding: 20px; }
+#loading { position: absolute; top: 0; left: 0; height: 2px; width: 0; background: #1a73e8; transition: width 8s cubic-bezier(.1,.7,.3,1); }
+#loading.active { width: 85%; }
+
+#panel { display: none; background: #f8f9fa; border-bottom: 1px solid #ccc; padding: 8px; gap: 16px; flex-wrap: wrap; }
+#panel.open { display: flex; }
+#panel fieldset { border: 1px solid #ccc; border-radius: 6px; margin: 0; padding: 6px 8px; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+#panel input { padding: 5px 8px; border: 1px solid #ccc; border-radius: 4px; }
+#panel button { background: #e8eaed; }
+#log { width: 100%; margin: 0; max-height: 180px; overflow: auto; white-space: pre-wrap; background: #111; color: #ddd; padding: 8px; font: 12px ui-monospace, monospace; }
+</style>
+</head>
+<body>
+
+<div class="bar">
+  <span class="nav">
+    <button id="back" title="Back" disabled>&#8592;</button>
+    <button id="forward" title="Forward" disabled>&#8594;</button>
+    <button id="reload" title="Reload" disabled>&#8635;</button>
+  </span>
+  <input id="address" placeholder="Enter an address reachable from the agent, e.g. 192.168.1.1 or example.com" autocomplete="off" spellcheck="false">
+  <span id="status">Disconnected</span>
+  <button id="togglePanel" title="Connection settings and log">&#9881;</button>
+</div>
+
+<div id="panel" class="open">
+  <fieldset>
+    <legend>Agent</legend>
+    <input id="signaling" size="24" placeholder="Signaling URL">
+    <input id="room" value="agent-001" size="10" placeholder="Room">
+    <button id="connect">Connect</button>
+  </fieldset>
+  <fieldset>
+    <legend>Raw TCP test</legend>
+    <input id="host" value="192.168.1.1" size="14" placeholder="Host">
+    <input id="port" value="80" size="5" placeholder="Port">
+    <button id="tcpTest">Open TCP + HTTP GET</button>
+  </fieldset>
+  <pre id="log"></pre>
+</div>
+
+<div id="viewport">
+  <div id="placeholder">Connect to the agent, then type an address above.<br>Every request of the page is fetched by the agent over WebRTC.</div>
+  <iframe id="frame" name="viewer" hidden></iframe>
+  <div id="loading"></div>
+</div>
+
+<script>
+const CHUNK = 16 * 1024;
+const $ = id => document.getElementById(id);
+const frame = $("frame");
+
+let ws;
+let pc;
+let prefix;
+let currentTarget = null; // remote URL shown in the frame
+const peerId = "page-" + Math.random().toString(36).slice(2, 10);
+
+// signaling_server.py fills the meta tag when it serves this page.
+$("signaling").value = document.querySelector('meta[name="signaling"]').content
+  || `${location.protocol === "https:" ? "wss" : "ws"}://${location.hostname || "localhost"}:9000`;
+
+function log(...args) {
+  const el = $("log");
+  el.textContent += args.join(" ") + "\n";
+  el.scrollTop = el.scrollHeight;
+}
+
+function setStatus(text, color) {
+  $("status").textContent = text;
+  $("status").style.setProperty("--dot", color);
+}
+
+function connected() {
+  return pc && pc.connectionState === "connected";
+}
+
+// ------------------------------------------------------------ service worker
+
+const swReady = (async () => {
+  if (!navigator.serviceWorker) {
+    throw new Error("Service workers are unavailable. Open this page via http://localhost / 127.0.0.1 or HTTPS.");
+  }
+  await navigator.serviceWorker.register("sw.js");
+  const registration = await navigator.serviceWorker.ready;
+  prefix = new URL(registration.scope).pathname + "__p/";
+  return registration;
+})();
+swReady.catch(e => log("ERROR:", e.message));
+
+navigator.serviceWorker?.addEventListener("message", event => {
+  if (event.data?.type === "fetch") tunnelFetch(event.data, event.ports[0]);
+  if (event.data?.type === "base?") event.ports[0].postMessage(currentTarget);
+});
+navigator.serviceWorker?.startMessages();
+
+function toLocal(target) {
+  const u = new URL(target);
+  return `${prefix}${u.protocol.slice(0, -1)}/${u.host}${u.pathname}${u.search}${u.hash}`;
+}
+
+function toTarget(localUrl) {
+  const u = new URL(localUrl, location.href);
+  if (u.origin !== location.origin || !u.pathname.startsWith(prefix)) return null;
+  const m = u.pathname.slice(prefix.length).match(/^(https?)\/([^/]+)(\/.*)?$/);
+  return m ? `${m[1]}://${m[2]}${m[3] || "/"}${u.search}${u.hash}` : null;
+}
+
+// ------------------------------------------------------------ HTTP over WebRTC
+
+// The proxied page's JavaScript sees this browser, so upstream requests must
+// claim the same identity or anti-bot checks (e.g. Google search) fail.
+const identityHeaders = [["user-agent", navigator.userAgent]];
+if (navigator.userAgentData) {
+  const { brands, mobile, platform } = navigator.userAgentData;
+  identityHeaders.push(
+    ["sec-ch-ua", brands.map(b => `"${b.brand}";v="${b.version}"`).join(", ")],
+    ["sec-ch-ua-mobile", mobile ? "?1" : "?0"],
+    ["sec-ch-ua-platform", `"${platform}"`],
+  );
+}
+
+function acceptLanguage() {
+  const langs = navigator.languages?.length ? navigator.languages : [navigator.language || "en-US"];
+  return langs.map((lang, i) => (i ? `${lang};q=${Math.max(0.1, 1 - i / 10).toFixed(1)}` : lang)).join(",");
+}
+
+function tunnelFetch(request, port) {
+  if (!connected()) {
+    port.postMessage({ type: "error", message: "Not connected to the agent." });
+    return;
+  }
+
+  const headers = request.headers.slice();
+  const has = name => headers.some(([n]) => n === name);
+  if (!has("accept-language")) headers.push(["accept-language", acceptLanguage()]);
+  for (const [name, value] of identityHeaders) {
+    if (!has(name)) headers.push([name, value]);
+  }
+  const body = request.body ? new Uint8Array(request.body) : null;
+
+  const dc = pc.createDataChannel("http");
+  dc.binaryType = "arraybuffer";
+  let finished = false;
+
+  port.onmessage = ({ data }) => {
+    if (data.type === "cancel") {
+      finished = true;
+      dc.close();
+    }
+  };
+
+  dc.onopen = () => {
+    dc.send(JSON.stringify({
+      method: request.method,
+      url: request.url,
+      headers,
+      cookieWrites: request.cookieWrites || [],
+      bodyLength: body ? body.length : 0,
+    }));
+    for (let i = 0; body && i < body.length; i += CHUNK) {
+      dc.send(body.subarray(i, i + CHUNK));
+    }
+  };
+
+  dc.onmessage = ({ data }) => {
+    if (typeof data !== "string") {
+      port.postMessage({ type: "chunk", data }, [data]);
+      return;
+    }
+    const message = JSON.parse(data);
+    if (message.type === "end" || message.type === "error") {
+      finished = true;
+      if (message.type === "error") log("HTTP error:", request.url, message.message);
+      dc.close();
+    }
+    port.postMessage(message);
+  };
+
+  dc.onclose = () => {
+    if (!finished) port.postMessage({ type: "error", message: "Tunnel closed unexpectedly." });
+  };
+}
+
+// ------------------------------------------------------------ browser chrome
+
+function normalizeAddress(text) {
+  text = text.trim();
+  if (!text) return null;
+  if (/^https?:\/\//i.test(text)) return text;
+  const host = text.split(/[/?#]/)[0];
+  const local = /^(localhost|\d{1,3}(\.\d{1,3}){3}|\[[0-9a-f:]+\])(:\d+)?$/i.test(host) || !host.includes(".");
+  return (local ? "http://" : "https://") + text;
+}
+
+async function navigate(text) {
+  const target = normalizeAddress(text);
+  if (!target) return;
+  await swReady;
+  if (!connected()) {
+    log("Connect to the agent first.");
+    $("panel").classList.add("open");
+    return;
+  }
+  $("address").value = target;
+  $("placeholder").hidden = true;
+  frame.hidden = false;
+  $("loading").classList.add("active");
+  frame.src = toLocal(target);
+}
+
+$("address").addEventListener("keydown", event => {
+  if (event.key !== "Enter") return;
+  event.preventDefault();
+  navigate($("address").value);
+  $("address").blur();
+});
+
+frame.addEventListener("load", async () => {
+  $("loading").classList.remove("active");
+  let href;
+  try {
+    href = frame.contentWindow.location.href;
+  } catch {
+    return; // navigated outside the proxy
+  }
+  const target = toTarget(href);
+  if (!target) return;
+  currentTarget = target;
+  if (document.activeElement !== $("address")) $("address").value = target;
+  try {
+    document.title = (frame.contentDocument.title || new URL(target).host) + " - WebRTC P2P Browser";
+  } catch { /* ignore */ }
+  (await swReady).active?.postMessage({ type: "base", base: target });
+  frame.contentWindow.addEventListener("beforeunload", () => $("loading").classList.add("active"));
+  updateNavButtons();
+});
+
+function updateNavButtons() {
+  const ready = !frame.hidden;
+  $("back").disabled = !ready;
+  $("forward").disabled = !ready;
+  $("reload").disabled = !ready;
+}
+
+$("back").onclick = () => frame.contentWindow.history.back();
+$("forward").onclick = () => frame.contentWindow.history.forward();
+$("reload").onclick = () => frame.contentWindow.location.reload();
+$("togglePanel").onclick = () => $("panel").classList.toggle("open");
+
+// ------------------------------------------------------------ signaling / WebRTC
+
+// Chrome may need ~40 s to declare gathering "complete" (STUN timeouts on
+// unused interfaces), so cap the wait; later candidates are trickled.
+async function waitIce(peer, timeoutMs = 2000) {
+  if (peer.iceGatheringState === "complete") return;
+  await new Promise(resolve => {
+    const timer = setTimeout(done, timeoutMs);
+    function done() {
+      clearTimeout(timer);
+      peer.removeEventListener("icegatheringstatechange", check);
+      resolve();
+    }
+    function check() {
+      if (peer.iceGatheringState === "complete") done();
+    }
+    peer.addEventListener("icegatheringstatechange", check);
+  });
+}
+
+async function connectPeer() {
+  const signaling = $("signaling").value;
+  const room = $("room").value;
+
+  ws?.close();
+  pc?.close();
+  setStatus("Connecting…", "#f9ab00");
+
+  ws = new WebSocket(signaling);
+  try {
+    await new Promise((resolve, reject) => {
+      ws.onopen = resolve;
+      ws.onerror = () => reject(new Error(`cannot reach signaling server ${signaling}`));
+    });
+  } catch (e) {
+    log("ERROR:", e.message);
+    setStatus("Disconnected", "#d93025");
+    return;
+  }
+
+  log("Signaling connected");
+  ws.send(JSON.stringify({ type: "join", room, role: "browser" }));
+
+  const peer = pc = new RTCPeerConnection({
+    iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
+  });
+
+  peer.onconnectionstatechange = () => {
+    log("WebRTC:", peer.connectionState);
+    if (peer !== pc) return;
+    const colors = { connected: "#1e8e3e", connecting: "#f9ab00", new: "#f9ab00" };
+    const label = peer.connectionState[0].toUpperCase() + peer.connectionState.slice(1);
+    setStatus(label, colors[peer.connectionState] || "#d93025");
+    if (peer.connectionState === "connected") {
+      $("panel").classList.remove("open");
+      if (frame.hidden && $("address").value) navigate($("address").value);
+    }
+  };
+
+  let answered = false;
+  ws.onmessage = async event => {
+    const message = JSON.parse(event.data);
+    if (message.type === "answer" && message.id === peerId && !answered) {
+      answered = true;
+      await peer.setRemoteDescription({ type: "answer", sdp: message.sdp });
+      log("Answer received");
+    }
+  };
+
+  const control = peer.createDataChannel("control");
+  control.onopen = () => log("Control channel open");
+
+  let offerSent = false;
+  const sentCandidates = new Set();
+  const socket = ws;
+  peer.onicecandidate = ({ candidate }) => {
+    if (!offerSent || !candidate || !candidate.candidate) return;
+    if (sentCandidates.has(candidate.candidate)) return;
+    if (socket.readyState !== WebSocket.OPEN) return;
+    socket.send(JSON.stringify({
+      type: "candidate",
+      id: peerId,
+      candidate: candidate.candidate,
+      sdpMid: candidate.sdpMid,
+      sdpMLineIndex: candidate.sdpMLineIndex,
+    }));
+  };
+
+  const offer = await peer.createOffer();
+  await peer.setLocalDescription(offer);
+  await waitIce(peer);
+
+  const sdp = peer.localDescription.sdp;
+  for (const line of sdp.split(/\r?\n/)) {
+    if (line.startsWith("a=candidate:")) sentCandidates.add(line.slice(2));
+  }
+  ws.send(JSON.stringify({ type: "offer", id: peerId, sdp }));
+  offerSent = true;
+  log(`Offer sent (${sentCandidates.size} ICE candidates)`);
+
+  setTimeout(() => {
+    if (!answered && peer === pc) {
+      log(`No answer from an agent in room "${room}". Is agent.py running with the same ROOM and SIGNALING?`);
+      setStatus("No agent", "#d93025");
+    }
+  }, 10000);
+}
+
+$("connect").onclick = connectPeer;
+
+// ------------------------------------------------------------ raw TCP test
+
+$("tcpTest").onclick = () => {
+  if (!connected()) {
+    log("Connect to the agent first.");
+    return;
+  }
+
+  const host = $("host").value;
+  const port = $("port").value;
+
+  const dc = pc.createDataChannel(`tcp:${host}:${port}`);
+  dc.binaryType = "arraybuffer";
+  const decoder = new TextDecoder();
+
+  dc.onopen = () => {
+    log("TCP tunnel opened:", host, port);
+    dc.send(
+      "GET / HTTP/1.1\r\n" +
+      "Host: " + host + "\r\n" +
+      "Connection: close\r\n\r\n"
+    );
+  };
+
+  dc.onmessage = event => {
+    log(typeof event.data === "string" ? event.data : decoder.decode(event.data, { stream: true }));
+  };
+
+  dc.onclose = () => log("TCP tunnel closed");
+};
+</script>
+</body>
+</html>
