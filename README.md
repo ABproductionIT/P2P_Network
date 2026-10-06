@@ -26,7 +26,7 @@ Two ways to browse through the agent:
 ```bash
 git clone https://github.com/ABproductionIT/P2P_Network.git
 cd P2P_Network
-git checkout develop
+git checkout main
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -98,7 +98,7 @@ The client lives under **`docs/`** so Pages can publish it without coupling to P
 
 1. Open [ABproductionIT/P2P_Network](https://github.com/ABproductionIT/P2P_Network) → **Settings** → **Pages**.
 2. Under **Build and deployment** → **Source**, choose **Deploy from a branch**.
-3. **Branch**: `develop` · **Folder**: `/docs` → **Save**.
+3. **Branch**: `main` · **Folder**: `/docs` → **Save**.
 4. Wait a minute for the green “Your site is live at …” banner.
 
 Expected URL:
