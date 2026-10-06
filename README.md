@@ -49,7 +49,7 @@ sequenceDiagram
 | What you type | Result |
 |---------------|--------|
 | `ws://10.10.1.97:9000` | Correct for bare `signaling_server.py` (no TLS) |
-| `10.10.1.97:9000` | Normalized to `ws://…` (agent + local HTTP client) |
+| `10.10.1.97:9000` | Normalized to `ws://…` (agent) |
 | `wss://10.10.1.97:9000` | Fails unless TLS is in front — agent retries `ws://` once |
 | `0.0.0.0:9000` / `wss://0.0.0.0:9000` | **Rejected** — bind address only; use `127.0.0.1` or your LAN IP |
 

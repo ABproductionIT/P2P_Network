@@ -171,7 +171,7 @@ async def handle_tcp_channel(channel, inbox):
         try:
             while (message := await inbox.get()) is not None:
                 if message == b"":
-                    break  # EOF from local_proxy; the agent closes the channel
+                    break  # EOF from the client; the agent closes the channel
                 writer.write(message.encode() if isinstance(message, str) else message)
                 await writer.drain()
         except Exception as e:
@@ -366,7 +366,7 @@ peers = {}
 
 
 class Peer:
-    """One connected client (browser page or local_proxy.py)."""
+    """One connected browser client."""
 
     def __init__(self, peer_id):
         self.id = peer_id
