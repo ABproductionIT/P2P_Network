@@ -44,21 +44,26 @@ sequenceDiagram
   Agent-->>Client: response from agent network
 ```
 
-## Run on a VPS
+## Run on a VPS (no sudo)
+
+Uses **[uv](https://docs.astral.sh/uv/)** in user space — do **not** use `python3 -m venv` (breaks on Python 3.14 without `ensurepip` / without apt).
 
 ```bash
+# one-time: install uv (user space)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+source "$HOME/.local/bin/env"
+
 git clone https://github.com/ABproductionIT/P2P_Network.git
 cd P2P_Network
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+./scripts/setup.sh
+# or: uv venv .venv && uv pip install -r requirements.txt --python .venv/bin/python
 ```
 
-**Signaling** (defaults `0.0.0.0:9000`):
+**Signaling** (defaults `0.0.0.0:9000` — no root):
 
 ```bash
-python signaling_server.py
-# or: python signaling_server.py --host 0.0.0.0 --port 9000
+./scripts/run-signaling.sh
+# or: .venv/bin/python signaling_server.py --host 0.0.0.0 --port 9000
 ```
 
 Open the firewall for that port. From the **HTTPS** Pages client you need TLS in front of the process (nginx/Caddy) and a **`wss://your-domain`** URL — plain `ws://` only works when the page itself is HTTP.
@@ -66,7 +71,7 @@ Open the firewall for that port. From the **HTTPS** Pages client you need TLS in
 **Agent** (on the machine whose network you expose; same username the client will use):
 
 ```bash
-python agent.py --signaling wss://your-domain --username alice
+.venv/bin/python agent.py --signaling wss://your-domain --username alice
 ```
 
 **Client:** open the [live page](https://abproductionit.github.io/P2P_Network/), enter `wss://your-domain` and `alice`, click **Connect**, then browse.
