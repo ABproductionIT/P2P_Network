@@ -1,0 +1,10 @@
+services:
+  chat:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:9000:9000"
+    environment:
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-}
+      TURN_URLS: ${TURN_URLS:-}
+      TURN_SECRET: ${TURN_SECRET:-}

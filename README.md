@@ -1,101 +1,85 @@
-# WebRTC P2P TCP Proxy
+# P2P Net — WebRTC chat
 
-**Live client:** [https://abproductionit.github.io/P2P_Network/](https://abproductionit.github.io/P2P_Network/)
+Python signaling server + browser clients. Clients join a room and exchange text through reliable, ordered **WebRTC DataChannels**. The signaling server relays only addressed SDP/ICE messages, never chat messages. No proxy agent, database, build step, cPanel or Passenger is needed.
 
-Browse the internet (or a LAN) through another machine over **WebRTC**. The static browser client runs on GitHub Pages; a small Python **signaling server** and **agent** run on a VPS / host you control. Application traffic goes peer-to-peer; the WebSocket server is signaling only.
-
-## Architecture
-
-Browser ↔ signaling ↔ agent; HTTP/TCP then rides a WebRTC data channel.
-
-```mermaid
-flowchart LR
-  Browser["Browser client<br/>Pages or local docs/"]
-  Sig["Signaling<br/>plain ws:// :9000"]
-  Agent["Agent host<br/>agent.py"]
-  Net["Target network<br/>HTTP / TCP"]
-
-  Browser <-->|"ws:// LAN · or wss:// + TLS"| Sig
-  Agent <-->|"ws://HOST:9000"| Sig
-  Browser <-->|"WebRTC data channel"| Agent
-  Agent -->|"fetch / TCP"| Net
-```
-
-## Connect flow
-
-Enter the signaling URL and a shared username, connect, then browse through the agent.
-
-```mermaid
-sequenceDiagram
-  actor User
-  participant Client as Browser client
-  participant Sig as Signaling
-  participant Agent as agent.py
-
-  User->>Client: Server URL + username
-  User->>Client: Connect
-  Client->>Sig: join room
-  Agent->>Sig: join same room
-  Sig-->>Client: peer present
-  Sig-->>Agent: peer present
-  Client->>Agent: WebRTC + data channel
-  User->>Client: open URL / host
-  Client->>Agent: request over data channel
-  Agent-->>Client: response from agent network
-```
-
-## Signaling URL rules (read this)
-
-| What you type | Result |
-|---------------|--------|
-| `ws://10.10.1.97:9000` | Correct for bare `signaling_server.py` (no TLS) |
-| `10.10.1.97:9000` | Normalized to `ws://…` (agent) |
-| `wss://10.10.1.97:9000` | Fails unless TLS is in front — agent retries `ws://` once |
-| `0.0.0.0:9000` / `wss://0.0.0.0:9000` | **Rejected** — bind address only; use `127.0.0.1` or your LAN IP |
-
-- **Agent CLI** can always use plain `ws://` (recommended for local/VPS without certs).
-- **GitHub Pages client is HTTPS** — browsers block mixed-content `ws://`. For Pages you need TLS (nginx/Caddy) + `wss://`, **or** open `docs/index.html` via a local `http://` server and use `ws://`.
-
-## Run on a VPS (no sudo)
-
-Uses **[uv](https://docs.astral.sh/uv/)** in user space — do **not** use `python3 -m venv` (breaks on Python 3.14 without `ensurepip` / without apt).
+## Quick start (Python 3.10+)
 
 ```bash
-# one-time: install uv (user space)
-curl -LsSf https://astral.sh/uv/install.sh | sh
-source "$HOME/.local/bin/env"
-
-git clone https://github.com/ABproductionIT/P2P_Network.git
-cd P2P_Network
-./scripts/setup.sh
-# or: uv venv .venv && uv pip install -r requirements.txt --python .venv/bin/python
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python signaling_server.py --host 0.0.0.0 --port 9000
 ```
 
-### Run in a terminal (foreground — watch the logs)
+Alternatively, with uv: `./scripts/setup.sh`, then `./scripts/run-signaling.sh`.
 
-Start signaling and the agent **in a normal terminal session**, in the **foreground**. Logs go to that terminal’s **stdout/stderr**. Press **Ctrl+C** in the same terminal to stop. Do **not** use `nohup`, `&`, `systemd`, `screen`/`tmux` detach, or other backgrounding if you want to see the logs there.
+1. Open **http://localhost:9000** in two browsers or tabs.
+2. Enter a name and join. Click **Скопировать приглашение**.
+3. Open the invitation in the second browser, enter another name, join.
+4. Wait for **чат подключён**, then send a message. Enter sends; Shift+Enter adds a line break.
 
-**Signaling** (binds `0.0.0.0:9000` — no root) — leave this terminal open:
+For another device, use your server's real IP/domain instead of localhost. When sharing a link, both the page address and signaling address must be reachable by the recipient. For internet deployment use HTTPS/WSS below.
+
+## VPS / Docker / HTTPS
+
+The server serves the client at `/`, JavaScript at `/chat.js`, health at `/health`, WebSocket at `/ws`.
 
 ```bash
-./scripts/run-signaling.sh
-# or: .venv/bin/python signaling_server.py --host 0.0.0.0 --port 9000
+cp .env.example .env
+# Edit .env: set your allowed origin, TURN details; remove TURN variables if unused.
+docker compose up -d --build
 ```
 
-Startup logs print connect URLs like `ws://127.0.0.1:9000` and `ws://<LAN-IP>:9000`. Open the firewall for that port if peers are remote.
+Compose publishes HTTP only on **127.0.0.1:9000**. Install Caddy on the host, replace the domain in `Caddyfile.example`, and use it as your Caddy configuration. Point DNS to the VPS and allow inbound TCP 80/443. Caddy terminates HTTPS and proxies WebSockets. Open `https://your-domain`; the client defaults to `wss://your-domain/ws`.
 
-**Agent** (separate terminal on the machine whose network you expose; same username the client will use) — leave this terminal open too:
+Without Docker, run the Python command above behind the same reverse proxy. Set environment variables with your process manager or shell: Python does **not** load `.env` automatically.
+
+Use **one server process/replica**: room state is in memory. Horizontal scaling requires shared room presence/routing, which is not implemented.
+
+## STUN / TURN
+
+The client receives ICE configuration when joining. Google STUN is used by default. STUN alone cannot connect every pair of networks. For reliable internet use, provide coturn or a compatible TURN service supporting REST/HMAC credentials:
 
 ```bash
-# LAN / no TLS (typical):
-.venv/bin/python agent.py --signaling ws://10.10.1.97:9000 --username alice
-# same machine as signaling:
-.venv/bin/python agent.py --signaling ws://127.0.0.1:9000 --username alice
+export TURN_URLS='turn:turn.example.com:3478?transport=udp,turn:turn.example.com:3478?transport=tcp'
+export TURN_SECRET='your-long-random-secret'
+export ALLOWED_ORIGINS='https://chat.example.com'
+.venv/bin/python signaling_server.py
 ```
 
-**Client options:**
+Configure coturn with `use-auth-secret`, matching `static-auth-secret`, a realm, public IP/external-IP mapping if applicable, and a relay port range. Open 3478 UDP/TCP and that relay range. For restrictive networks, additionally configure TURN TLS with a valid certificate and add its `turns:` URL. TURN is a separate service and is **not included** in Compose.
 
-1. **Local HTTP** (plain `ws://` works): serve `docs/` over HTTP and enter `ws://10.10.1.97:9000` + `alice`.
-2. **GitHub Pages** (HTTPS): put TLS in front of `:9000`, then enter `wss://your-domain` + `alice` on the [live page](https://abproductionit.github.io/P2P_Network/).
+The server issues credentials valid for one hour; the shared TURN secret is never sent to the browser. Rejoin to obtain fresh credentials if an ICE restart is needed after expiry. TURN can relay WebRTC traffic, but does not terminate DataChannel encryption. Actual connectivity across external NATs must be tested on the deployment network.
 
-Prototype only — do not expose the agent to untrusted users without auth and destination limits.
+## Behavior and boundaries
+
+- Up to 8 clients per room, full mesh: each pair has its own connection.
+- Random 128-bit invitation room IDs; anyone with the link can enter. There are no accounts or verified identities. Names are self-selected.
+- Room links use the URL fragment. The room ID is still visible to the signaling service when joining.
+- Reliable delivery on each open DataChannel; no offline delivery, receipt acknowledgments or persistence. The UI reports partial sends. No global message ordering across senders.
+- History stays in the tab (maximum 500 rendered entries), disappears on refresh, and is not synchronized to newcomers.
+- Signaling reconnect uses exponential backoff and rebuilds membership/connections. Existing channels can carry messages during the retry delay. Failed peer connections trigger up to three ICE restart attempts from their initiator.
+- Text limit 4,000 characters; bounded channel send buffers. Server: max 64 KiB signal, rate limit, max 1,000 sockets, same-room routing, server-assigned sender IDs.
+- `ALLOWED_ORIGINS` is an optional comma-separated browser Origin allowlist; it is not authentication. For public production deployment add access control and IP-level connection limits at your edge, especially to prevent abuse of TURN credentials.
+- HTML messages are displayed as text, not rendered. No external frontend scripts.
+- GitHub Pages can serve `docs/`: enter the external **wss://…/ws** endpoint. Add the Pages origin to `ALLOWED_ORIGINS`. The former proxy service worker is unregistered by the new client.
+
+## Signaling protocol
+
+```json
+{"type":"join","room":"random-room-id","name":"Alice"}
+{"type":"signal","to":"server-assigned-peer-id","data":{"description":{"type":"offer","sdp":"..."}}}
+{"type":"signal","to":"server-assigned-peer-id","data":{"candidate":{"candidate":"...","sdpMid":"0","sdpMLineIndex":0}}}
+```
+
+Server messages: `joined` (own ID, existing peers, ICE servers), `peer-joined`, `peer-left`, `signal` (trusted `from` ID), `error`. Newcomers initiate offers to existing peers, preventing simultaneous initial offers. Browser queues ICE candidates until remote SDP is set and serializes signaling per peer.
+
+## Tests
+
+```bash
+python3 -m unittest discover -s tests -v
+node --check docs/chat.js
+# Optional full browser test: install Playwright and its Chromium first
+node tests/browser.cjs
+```
+
+Old proxy source is retained in `legacy/` for reference; it is not used and is not compatible with the new signaling protocol. Its historical dependencies were aiortc, websockets and curl_cffi.
