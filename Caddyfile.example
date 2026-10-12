@@ -1,0 +1,4 @@
+# Replace with your domain. DNS must point to the VPS, ports 80/443 must be open.
+chat.example.com {
+    reverse_proxy 127.0.0.1:9000
+}
